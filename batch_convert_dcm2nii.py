@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Batch DICOM to NIfTI Converter for ADNI PET Dataset
+Batch DICOM to NIfTI Converter for ADNI MRI Dataset
 
-This script processes all patient directories in the ADNI dataset and converts
-DICOM files to NIfTI format.
+This script processes all patient directories in the ADNI MRI dataset and converts
+DICOM files to NIfTI format, saving the NIfTI files in the same directory as the DICOM files.
 """
 
 import os
@@ -15,63 +15,79 @@ from tqdm import tqdm
 
 def find_dicom_directories(base_dir):
     """
-    Find all directories containing DICOM files in the ADNI dataset.
+    Find all directories containing DICOM files in the ADNI MRI dataset.
+    
+    The directory structure is:
+    base_dir/subject_id/scan_type/date_metadata/patient_id/*.dcm
     
     Returns:
-        List of tuples: (patient_id, dicom_dir_path)
+        List of tuples: (subject_id, scan_type, date_metadata, patient_id, dicom_dir_path)
     """
     base_path = Path(base_dir)
     dicom_dirs = []
     
-    # Iterate through patient directories
-    for patient_dir in sorted(base_path.iterdir()):
-        if not patient_dir.is_dir():
+    if not base_path.exists():
+        print(f"Warning: Directory does not exist: {base_dir}")
+        return dicom_dirs
+    
+    # Iterate through subject directories
+    for subject_dir in sorted(base_path.iterdir()):
+        if not subject_dir.is_dir():
             continue
         
-        patient_id = patient_dir.name
+        subject_id = subject_dir.name
         
-        # Look for AV45 PET scan directory
-        av45_dir = patient_dir / "AV45_Coreg,_Avg,_Std_Img_and_Vox_Siz,_Uniform_Resolution"
-        
-        if av45_dir.exists():
-            # Find the deepest directory containing .dcm files
-            for date_dir in av45_dir.iterdir():
-                if date_dir.is_dir():
-                    for scan_dir in date_dir.iterdir():
-                        if scan_dir.is_dir():
-                            # Check if this directory contains .dcm files
-                            dcm_files = list(scan_dir.glob("*.dcm"))
-                            if dcm_files:
-                                dicom_dirs.append((patient_id, scan_dir))
-                                break
+        # Iterate through scan type directories (e.g., MP-RAGE, Axial_T2_STAR)
+        for scan_type_dir in subject_dir.iterdir():
+            if not scan_type_dir.is_dir():
+                continue
+            
+            scan_type = scan_type_dir.name
+            
+            # Iterate through date/metadata directories
+            for date_metadata_dir in scan_type_dir.iterdir():
+                if not date_metadata_dir.is_dir():
+                    continue
+                
+                date_metadata = date_metadata_dir.name
+                
+                # Iterate through patient_id directories (innermost level before DICOM files)
+                for patient_id_dir in date_metadata_dir.iterdir():
+                    if not patient_id_dir.is_dir():
+                        continue
+                    
+                    patient_id = patient_id_dir.name
+                    
+                    # Check if this directory contains .dcm files
+                    dcm_files = list(patient_id_dir.glob("*.dcm"))
+                    if dcm_files:
+                        dicom_dirs.append((subject_id, scan_type, date_metadata, patient_id, patient_id_dir))
     
     return dicom_dirs
 
 
-def convert_patient(patient_id, dicom_dir, output_base_dir, no_compress=True):
+def convert_dicom_directory(subject_id, scan_type, date_metadata, patient_id, dicom_dir, no_compress=True):
     """
-    Convert a single patient's DICOM files to NIfTI.
+    Convert a single directory's DICOM files to NIfTI.
     
     Args:
-        patient_id: Patient identifier
+        subject_id: Subject identifier
+        scan_type: Scan type (e.g., MP-RAGE, Axial_T2_STAR)
+        date_metadata: Date/metadata identifier
+        patient_id: Patient identifier (innermost directory)
         dicom_dir: Path to directory containing DICOM files
-        output_base_dir: Base directory for output files
         no_compress: If True, save as .nii; if False, save as .nii.gz
     
     Returns:
         True if successful, False otherwise
     """
-    output_dir = Path(output_base_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create output filename
+    # Create output filename in the same directory
     extension = ".nii" if no_compress else ".nii.gz"
-    output_file = output_dir / f"{patient_id}_AV45{extension}"
+    output_file = dicom_dir / f"{subject_id}_{scan_type}_{date_metadata}{extension}"
     
     # Skip if already exists
     if output_file.exists():
-        print(f"  ⊙ Skipping {patient_id} (already exists)")
-        return True
+        return True  # Silent skip
     
     # Build command
     cmd = [
@@ -94,67 +110,98 @@ def convert_patient(patient_id, dicom_dir, output_base_dir, no_compress=True):
         )
         
         if result.returncode == 0:
-            print(f"  ✓ {patient_id}")
             return True
         else:
-            print(f"  ✗ {patient_id} - Conversion failed")
+            print(f"  ✗ {subject_id}/{scan_type}/{date_metadata}/{patient_id} - Conversion failed")
             print(f"    Error: {result.stderr[:200]}")
             return False
     
     except subprocess.TimeoutExpired:
-        print(f"  ✗ {patient_id} - Timeout")
+        print(f"  ✗ {subject_id}/{scan_type}/{date_metadata}/{patient_id} - Timeout")
         return False
     except Exception as e:
-        print(f"  ✗ {patient_id} - Error: {e}")
+        print(f"  ✗ {subject_id}/{scan_type}/{date_metadata}/{patient_id} - Error: {e}")
         return False
 
 
-def main():
-    # Configuration
-    base_dir = "/home/prml/RIMA/datasets/ADNI/AD_PET_130_FIN/ADNI"
-    output_dir = "/home/prml/RIMA/datasets/ADNI/AD_PET_130_FIN/ADNI_NII"
+def process_base_directory(base_dir, dataset_name):
+    """
+    Process a single base directory and convert all DICOM files found.
     
-    print("=" * 70)
-    print("ADNI PET DICOM to NIfTI Batch Converter")
-    print("=" * 70)
-    print(f"Input directory:  {base_dir}")
-    print(f"Output directory: {output_dir}")
-    print("=" * 70)
+    Args:
+        base_dir: Base directory to process
+        dataset_name: Name of the dataset for display purposes
+    
+    Returns:
+        Tuple of (successful_count, failed_count)
+    """
+    print(f"\nProcessing: {dataset_name}")
+    print(f"Directory: {base_dir}")
     
     # Find all DICOM directories
-    print("\nScanning for DICOM files...")
     dicom_dirs = find_dicom_directories(base_dir)
     
-    print(f"Found {len(dicom_dirs)} patients with DICOM data\n")
-    
     if not dicom_dirs:
-        print("No DICOM directories found!")
-        return
+        print(f"  No DICOM directories found")
+        return 0, 0
     
-    # Process each patient
-    print("Starting conversion...\n")
+    print(f"  Found {len(dicom_dirs)} DICOM directories")
     
     successful = 0
     failed = 0
     
-    for patient_id, dicom_dir in tqdm(dicom_dirs, desc="Converting"):
-        success = convert_patient(patient_id, dicom_dir, output_dir, no_compress=True)
+    for subject_id, scan_type, date_metadata, patient_id, dicom_dir in tqdm(dicom_dirs, desc=f"  Converting {dataset_name}", leave=False):
+        success = convert_dicom_directory(subject_id, scan_type, date_metadata, patient_id, dicom_dir, no_compress=True)
         
         if success:
             successful += 1
         else:
             failed += 1
     
-    # Summary
+    print(f"  ✓ Successful: {successful}, ✗ Failed: {failed}")
+    
+    return successful, failed
+
+
+def main():
+    # Configuration - All MRI dataset directories
+    datasets = [
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_AD_MRI_T1_FIN/ADNI", "AD MRI T1"),
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_AD_MRI_T2_FIN/ADNI", "AD MRI T2"),
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_MCI_MRI_T1_FIN/ADNI", "MCI MRI T1"),
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_MCI_MRI_T2_FIN/ADNI", "MCI MRI T2"),
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_CN_MRI_T1_FIN/ADNI", "CN MRI T1"),
+        ("/home/prml/RIMA/datasets/ADNI/MRI-T1-T2/1204_CN_MRI_T2_FIN/ADNI", "CN MRI T2"),
+    ]
+    
+    print("=" * 70)
+    print("ADNI MRI DICOM to NIfTI Batch Converter")
+    print("=" * 70)
+    print("This script will convert DICOM files to NIfTI format")
+    print("NIfTI files will be saved in the same directory as DICOM files")
+    print("=" * 70)
+    
+    total_successful = 0
+    total_failed = 0
+    
+    # Process each dataset
+    for base_dir, dataset_name in datasets:
+        successful, failed = process_base_directory(base_dir, dataset_name)
+        total_successful += successful
+        total_failed += failed
+    
+    # Overall Summary
+    total = total_successful + total_failed
     print("\n" + "=" * 70)
-    print("CONVERSION SUMMARY")
+    print("OVERALL CONVERSION SUMMARY")
     print("=" * 70)
-    print(f"Total patients:  {len(dicom_dirs)}")
-    print(f"Successful:      {successful}")
-    print(f"Failed:          {failed}")
-    print(f"Success rate:    {successful/len(dicom_dirs)*100:.1f}%")
+    print(f"Total directories:  {total}")
+    print(f"Successful:         {total_successful}")
+    print(f"Failed:             {total_failed}")
+    if total > 0:
+        print(f"Success rate:       {total_successful/total*100:.1f}%")
     print("=" * 70)
-    print(f"\nOutput files saved to: {output_dir}")
+    print("\nNIfTI files saved in the same directories as DICOM files")
 
 
 if __name__ == '__main__':

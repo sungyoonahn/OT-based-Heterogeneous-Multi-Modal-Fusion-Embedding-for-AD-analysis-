@@ -67,14 +67,35 @@ CLASS_NAMES_PET = {
     "MCI_PET_86_FIN": 2,
 }
 
+CLASS_NAMES_MRI_T1 = {
+    "1204_AD_MRI_T1_FIN": 0,
+    "1204_CN_MRI_T1_FIN": 1,
+    "1204_MCI_MRI_T1_FIN": 2,
+}
+
+CLASS_NAMES_MRI_T2 = {
+    "1204_AD_MRI_T2_FIN": 0,
+    "1204_CN_MRI_T2_FIN": 1,
+    "1204_MCI_MRI_T2_FIN": 2,
+}
+
 
 def detect_class_names(root_dir: str) -> Dict[str, int]:
     """Auto-detect whether we're using MRI or PET based on available directories."""
     # Check which directories exist
     mri_exists = any(os.path.isdir(os.path.join(root_dir, d)) for d in CLASS_NAMES_MRI.keys())
     pet_exists = any(os.path.isdir(os.path.join(root_dir, d)) for d in CLASS_NAMES_PET.keys())
+    mri_t1_exists = any(os.path.isdir(os.path.join(root_dir, d)) for d in CLASS_NAMES_MRI_T1.keys())
+    mri_t2_exists = any(os.path.isdir(os.path.join(root_dir, d)) for d in CLASS_NAMES_MRI_T2.keys())
     
-    if mri_exists and not pet_exists:
+    # Priority: T1 > T2 > MRI > PET
+    if mri_t1_exists:
+        print("Detected MRI T1 dataset")
+        return CLASS_NAMES_MRI_T1
+    elif mri_t2_exists:
+        print("Detected MRI T2 dataset")
+        return CLASS_NAMES_MRI_T2
+    elif mri_exists and not pet_exists:
         print("Detected MRI dataset")
         return CLASS_NAMES_MRI
     elif pet_exists and not mri_exists:
@@ -114,6 +135,7 @@ class NiftiDataset(Dataset):
         augment: bool = False,
         max_samples_per_class: int | None = None,
         patient_ids_filter: Dict[str, List[str]] | None = None,
+        balance_to_minority: bool = False,
         seed: int = 42,
     ) -> None:
         self.root_dir = root_dir
@@ -122,6 +144,7 @@ class NiftiDataset(Dataset):
         self.augment = augment
         self.max_samples_per_class = max_samples_per_class
         self.patient_ids_filter = patient_ids_filter
+        self.balance_to_minority = balance_to_minority
         self.seed = seed
         self.samples: List[Tuple[str, int]] = []
         self.patient_ids_used: Dict[str, List[str]] = {class_name: [] for class_name in self.class_names.keys()}
@@ -148,6 +171,9 @@ class NiftiDataset(Dataset):
                 continue
             # Recursively search for .nii files in all subdirectories
             for root, dirs, files in os.walk(dir_path):
+                # Sort to ensure determinism
+                dirs.sort()
+                files.sort()
                 for file_name in files:
                     if file_name.endswith((".nii", ".nii.gz")):
                         file_path = os.path.join(root, file_name)
@@ -155,38 +181,58 @@ class NiftiDataset(Dataset):
                         if patient_id:
                             samples_by_class[class_dir].append((file_path, label, patient_id))
         
-        # Filter and limit samples per class
-        rng = random.Random(self.seed)
+        # Group samples by patient ID for each class
+        patient_groups_by_class: Dict[str, Dict[str, List[Tuple[str, int, str]]]] = {}
         for class_dir, class_samples in samples_by_class.items():
+            patient_groups: Dict[str, List[Tuple[str, int, str]]] = {}
+            for path, label, pid in class_samples:
+                if pid not in patient_groups:
+                    patient_groups[pid] = []
+                patient_groups[pid].append((path, label, pid))
+            patient_groups_by_class[class_dir] = patient_groups
+        
+        # Apply balancing or filtering
+        rng = random.Random(self.seed)
+        final_samples_by_class: Dict[str, List[Tuple[str, int, str]]] = {}
+        
+        for class_dir in samples_by_class.keys():
+            patient_groups = patient_groups_by_class[class_dir]
+            
             if self.patient_ids_filter and class_dir in self.patient_ids_filter:
                 # Filter by specific patient IDs
-                filtered_samples = [
-                    (path, label, pid) for path, label, pid in class_samples
-                    if pid in self.patient_ids_filter[class_dir]
-                ]
-                class_samples = filtered_samples
-            elif self.max_samples_per_class:
-                # Group by patient ID to ensure we select diverse patients
-                patient_groups: Dict[str, List[Tuple[str, int, str]]] = {}
-                for path, label, pid in class_samples:
-                    if pid not in patient_groups:
-                        patient_groups[pid] = []
-                    patient_groups[pid].append((path, label, pid))
-                
-                # Randomly select patients until we have enough samples
-                patient_ids = list(patient_groups.keys())
-                rng.shuffle(patient_ids)
-                
-                selected_samples = []
-                for pid in patient_ids:
-                    if len(selected_samples) >= self.max_samples_per_class:
-                        break
-                    # Take one sample per patient
-                    selected_samples.extend(patient_groups[pid][:1])
-                
-                class_samples = selected_samples[:self.max_samples_per_class]
+                filtered_samples = []
+                for pid in self.patient_ids_filter[class_dir]:
+                    if pid in patient_groups:
+                        filtered_samples.extend(patient_groups[pid][:1])  # One sample per patient
+                final_samples_by_class[class_dir] = filtered_samples
+            else:
+                # Take one sample per patient
+                class_samples = []
+                for pid, samples in patient_groups.items():
+                    class_samples.extend(samples[:1])
+                final_samples_by_class[class_dir] = class_samples
+        
+        # Balance to minority class if requested
+        if self.balance_to_minority and not self.patient_ids_filter:
+            # Find the minority class (smallest number of patients)
+            min_count = min(len(samples) for samples in final_samples_by_class.values())
+            print(f"Balancing to minority class with {min_count} samples")
             
-            # Add to final samples list and track patient IDs
+            for class_dir, class_samples in final_samples_by_class.items():
+                if len(class_samples) > min_count:
+                    # Randomly sample to match minority class
+                    rng.shuffle(class_samples)
+                    final_samples_by_class[class_dir] = class_samples[:min_count]
+        
+        # Apply max_samples_per_class if specified (overrides balance_to_minority)
+        if self.max_samples_per_class:
+            for class_dir, class_samples in final_samples_by_class.items():
+                if len(class_samples) > self.max_samples_per_class:
+                    rng.shuffle(class_samples)
+                    final_samples_by_class[class_dir] = class_samples[:self.max_samples_per_class]
+        
+        # Add to final samples list and track patient IDs
+        for class_dir, class_samples in final_samples_by_class.items():
             for path, label, pid in class_samples:
                 self.samples.append((path, label))
                 if pid not in self.patient_ids_used[class_dir]:
@@ -223,6 +269,16 @@ class NiftiDataset(Dataset):
         path, label = self.samples[index]
         img = nib.load(path).get_fdata().astype(np.float32)
         img = np.nan_to_num(img)
+        
+        # Handle both 3D and 4D volumes (squeeze extra dimensions)
+        while img.ndim > 3:
+            # If there's a singleton dimension, squeeze it
+            if 1 in img.shape:
+                img = np.squeeze(img)
+            else:
+                # If 4D with multiple volumes, take the first one
+                img = img[..., 0]
+        
         volume = torch.from_numpy(img).unsqueeze(0)  # (1, D, H, W)
         volume = self._resize_volume(volume)
 
@@ -561,6 +617,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=[10, 18, 34, 50, 101, 152, 200],
         help="Depth of the ResNet model (default: 101).",
     )
+    parser.add_argument(
+        "--classes",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of classes to train on (e.g. AD CN). If not specified, uses all detected classes.",
+    )
+    parser.add_argument(
+        "--balance-to-minority",
+        action="store_true",
+        help="Balance dataset by randomly sampling majority classes to match minority class count.",
+    )
     return parser.parse_args(argv)
 
 
@@ -634,46 +702,160 @@ def main() -> None:
     # Auto-detect MRI or PET dataset
     class_names = detect_class_names(args.data_dir)
 
+    # Filter classes if specified
+    if args.classes:
+        print(f"Filtering classes to: {args.classes}")
+        # Map simple names (AD, CN, MCI) to full directory names
+        filtered_class_names = {}
+        for simple_name in args.classes:
+            found = False
+            for dir_name, label in class_names.items():
+                # Check if simple_name appears in dir_name with underscores
+                # Handles both "AD_MRI_130_FIN" and "1204_AD_MRI_T1_FIN" formats
+                if (dir_name.startswith(simple_name + "_") or 
+                    f"_{simple_name}_" in dir_name):
+                    filtered_class_names[dir_name] = len(filtered_class_names) # Re-index 0, 1, ...
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Class {simple_name} not found in available directories: {list(class_names.keys())}")
+        class_names = filtered_class_names
+        print(f"Using classes: {class_names}")
+
     # Load patient IDs if specified
     patient_ids_filter = None
+    fixed_split = False
+    train_ids_filter = None
+    val_ids_filter = None
+
     if args.load_patient_ids:
         print(f"Loading patient IDs from {args.load_patient_ids}")
         with open(args.load_patient_ids, 'r') as f:
-            patient_ids_filter = json.load(f)
-        print(f"Loaded patient IDs for {len(patient_ids_filter)} classes")
+            loaded_ids = json.load(f)
+        
+        # Check if this is a fixed split file
+        if "train" in loaded_ids and "val" in loaded_ids:
+            print("Detected fixed train/val split in JSON file.")
+            fixed_split = True
+            
+            # Helper to map IDs for a specific split
+            def map_ids(source_ids, class_names):
+                mapped_filter = {}
+                for class_dir in class_names.keys():
+                    if class_dir in source_ids:
+                        mapped_filter[class_dir] = source_ids[class_dir]
+                    else:
+                        # Try mapping
+                        prefix = class_dir.split('_')[0]
+                        mapped_key = None
+                        for key in source_ids.keys():
+                            if key.startswith(prefix + "_"):
+                                mapped_key = key
+                                break
+                        if mapped_key:
+                            mapped_filter[class_dir] = source_ids[mapped_key]
+                        else:
+                            mapped_filter[class_dir] = []
+                return mapped_filter
 
-    full_dataset = NiftiDataset(
-        root_dir=args.data_dir,
-        target_shape=tuple(args.target_shape),
-        class_names=class_names,
-        augment=args.augment,
-        max_samples_per_class=args.max_samples_per_class,
-        patient_ids_filter=patient_ids_filter,
-        seed=args.seed,
-    )
-    
-    # Save patient IDs used
-    patient_ids_file = os.path.join(args.save_path, "patient_ids.json")
-    with open(patient_ids_file, 'w') as f:
-        json.dump(full_dataset.patient_ids_used, f, indent=2)
-    print(f"Saved patient IDs to {patient_ids_file}")
-    
-    # Print sample counts per class
-    print("\nSamples per class:")
-    for class_name in class_names.keys():
-        count = len(full_dataset.patient_ids_used[class_name])
-        print(f"  {class_name}: {count} patients")
-    print(f"Total samples: {len(full_dataset)}\n")
-    train_dataset, val_dataset = split_dataset(full_dataset, args.val_fraction, args.seed)
+            train_ids_filter = map_ids(loaded_ids["train"], class_names)
+            val_ids_filter = map_ids(loaded_ids["val"], class_names)
+            
+        else:
+            # Handle cross-modality mapping (MRI <-> PET) for flat list
+            patient_ids_filter = {}
+            for class_dir in class_names.keys():
+                # Direct match
+                if class_dir in loaded_ids:
+                    patient_ids_filter[class_dir] = loaded_ids[class_dir]
+                else:
+                    # Try mapping (MRI -> PET or PET -> MRI)
+                    prefix = class_dir.split('_')[0] # AD, CN, MCI
+                    
+                    # Find corresponding key in loaded_ids
+                    mapped_key = None
+                    for key in loaded_ids.keys():
+                        if key.startswith(prefix + "_"):
+                            mapped_key = key
+                            break
+                    
+                    if mapped_key:
+                        print(f"Mapping patient IDs from {mapped_key} to {class_dir}")
+                        patient_ids_filter[class_dir] = loaded_ids[mapped_key]
+                    else:
+                        print(f"Warning: No matching patient IDs found for class {class_dir}")
+                        patient_ids_filter[class_dir] = []
+            print(f"Loaded patient IDs for {len(patient_ids_filter)} classes")
+
+    if fixed_split:
+        print("Constructing Train and Validation datasets from fixed split...")
+        train_dataset = NiftiDataset(
+            root_dir=args.data_dir,
+            target_shape=tuple(args.target_shape),
+            class_names=class_names,
+            augment=args.augment,
+            max_samples_per_class=args.max_samples_per_class,
+            patient_ids_filter=train_ids_filter,
+            balance_to_minority=args.balance_to_minority,
+            seed=args.seed,
+        )
+        val_dataset = NiftiDataset(
+            root_dir=args.data_dir,
+            target_shape=tuple(args.target_shape),
+            class_names=class_names,
+            augment=False, # No augmentation for validation
+            max_samples_per_class=args.max_samples_per_class,
+            patient_ids_filter=val_ids_filter,
+            balance_to_minority=args.balance_to_minority,
+            seed=args.seed,
+        )
+        full_dataset = train_dataset # Just for logging count, though it's not the full set anymore
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples: {len(val_dataset)}")
+        
+    else:
+        full_dataset = NiftiDataset(
+            root_dir=args.data_dir,
+            target_shape=tuple(args.target_shape),
+            class_names=class_names,
+            augment=args.augment,
+            max_samples_per_class=args.max_samples_per_class,
+            patient_ids_filter=patient_ids_filter,
+            balance_to_minority=args.balance_to_minority,
+            seed=args.seed,
+        )
+        
+        # Save patient IDs used
+        patient_ids_file = os.path.join(args.save_path, "patient_ids.json")
+        with open(patient_ids_file, 'w') as f:
+            json.dump(full_dataset.patient_ids_used, f, indent=2)
+        print(f"Saved patient IDs to {patient_ids_file}")
+        
+        # Print sample counts per class
+        print("\nSamples per class:")
+        for class_name in class_names.keys():
+            count = len(full_dataset.patient_ids_used[class_name])
+            print(f"  {class_name}: {count} patients")
+        print(f"Total samples: {len(full_dataset)}\n")
+        train_dataset, val_dataset = split_dataset(full_dataset, args.val_fraction, args.seed)
 
     # Verify split balance
     print("\nVerifying split balance:")
-    def count_labels(subset, name):
+    def count_labels(dataset_obj, name):
         counts = {}
-        for idx in subset.indices:
-            _, label = subset.dataset.samples[idx]
-            class_name = [k for k, v in class_names.items() if v == label][0]
-            counts[class_name] = counts.get(class_name, 0) + 1
+        # Handle both Subset (has .indices) and NiftiDataset (iterate directly)
+        if hasattr(dataset_obj, 'indices'):
+            # It's a Subset
+            for idx in dataset_obj.indices:
+                _, label = dataset_obj.dataset.samples[idx]
+                class_name = [k for k, v in class_names.items() if v == label][0]
+                counts[class_name] = counts.get(class_name, 0) + 1
+        else:
+            # It's a NiftiDataset
+            for _, label in dataset_obj.samples:
+                class_name = [k for k, v in class_names.items() if v == label][0]
+                counts[class_name] = counts.get(class_name, 0) + 1
+                
         print(f"  {name} set:")
         for class_name in sorted(counts.keys()):
             print(f"    {class_name}: {counts[class_name]}")

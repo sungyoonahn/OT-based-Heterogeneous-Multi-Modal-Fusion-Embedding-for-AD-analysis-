@@ -1,35 +1,24 @@
-"""Multimodal MRI-PET Classification using Optimal Transport
+"""Multimodal MRI-PET Classification using Optimal Transport (No JAX)
 
 This script trains a multimodal model that combines MRI and PET scans using
 optimal transport for feature alignment. It uses 3D ResNet-50 backbones for
 both modalities and fuses them using optimal transport coupling.
 
+This version uses PyTorch and POT (Python Optimal Transport) instead of JAX/OTT.
+
 Expected directory layout:
 ADNI/
   AD_MRI_130_FIN/  (MRI scans)
   CN_MRI_229_FIN/
-  MCI_MRI_86_FIN/
   AD_PET_130_FIN/  (PET scans)
   CN_PET_229_FIN/
-  MCI_PET_86_FIN/
 """
 
 import os
-# JAX/XLA configuration for CPU usage
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-os.environ.setdefault("JAX_DISABLE_JIT", "1")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("JAX_ENABLE_X64", "True")  # Enable x64 for stability
-existing_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
-threading_flags = "--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=1"
-if "--xla_force_host_platform_device_count" not in existing_xla_flags:
-    os.environ["XLA_FLAGS"] = " ".join(filter(None, [existing_xla_flags, threading_flags]))
-
 import argparse
 import json
 import random
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Union
 from numbers import Number
 import time
 
@@ -45,14 +34,9 @@ from torch.utils.data import DataLoader, Dataset, random_split, Subset
 from torchvision.models.video.resnet import BasicBlock
 from tqdm import tqdm
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from perturbot.match import get_coupling_fot
 
-# OTT imports for custom solver
-import jax.numpy as jnp
-from ott.geometry import pointcloud
-from ott.problems.quadratic import quadratic_problem
-from ott.solvers.quadratic import gromov_wasserstein
-from ott.solvers.linear import sinkhorn
+# POT imports
+import ot
 
 # Class names for MRI and PET
 CLASS_NAMES_MRI = {
@@ -65,61 +49,100 @@ CLASS_NAMES_PET = {
     "CN_PET_229_FIN": 1,
 }
 
-def get_coupling_egw_ott_fixed(
+def get_coupling_gromov_pot(
     data: Tuple[Dict[Number, np.array], Dict[Number, np.array]], eps: float = 5e-3
 ) -> Tuple[Dict[Number, np.array], Dict]:
-    """Fixed version of get_coupling_egw_ott that works with newer OTT versions."""
+    """Gromov-Wasserstein coupling using POT."""
     X_dict = data[0]
     Y_dict = data[1]
     labels = X_dict.keys()
     Ts = {}
     log = {}
+    
     for l in labels:
         log[l] = {}
         start = time.time()
-
-        # Ensure inputs are JAX arrays
-        x_data = jnp.array(X_dict[l])
-        y_data = jnp.array(Y_dict[l])
         
-        # Check for NaNs
-        if jnp.isnan(x_data).any() or jnp.isnan(y_data).any():
-            print(f"Warning: NaNs detected in features for label {l}")
-            x_data = jnp.nan_to_num(x_data)
-            y_data = jnp.nan_to_num(y_data)
-
-        geom_xx = pointcloud.PointCloud(x=x_data, y=x_data, scale_cost="max_cost")
-        geom_yy = pointcloud.PointCloud(x=y_data, y=y_data, scale_cost="max_cost")
-
-        cost_time = time.time() - start
-        start = time.time()
-
-        prob = quadratic_problem.QuadraticProblem(
-            geom_xx,
-            geom_yy,
+        x_data = X_dict[l]
+        y_data = Y_dict[l]
+        
+        # Compute distance matrices
+        C1 = ot.dist(x_data, x_data, metric='euclidean')
+        C2 = ot.dist(y_data, y_data, metric='euclidean')
+        
+        # Normalize distance matrices
+        C1 /= C1.max()
+        C2 /= C2.max()
+        
+        p = ot.unif(len(x_data))
+        q = ot.unif(len(y_data))
+        
+        gw_map = ot.gromov.gromov_wasserstein(
+            C1, C2, p, q, 'square_loss', epsilon=eps, verbose=False
         )
-
-        # Instantiate Gromov-Wasserstein solver with linear_solver
-        solver = gromov_wasserstein.GromovWasserstein(
-            epsilon=eps, 
-            store_inner_errors=True, 
-            max_iterations=1000,
-            linear_solver=sinkhorn.Sinkhorn()
-        )
-
-        out = solver(prob)
-
+        
         end = time.time()
-        Ts[l] = np.array(out.matrix)
-
-        has_converged = bool(out.linear_convergence[out.n_iters - 1])
-        log[l]["n_iters_outer"] = out.n_iters
-        log[l]["converged_inner"] = has_converged
-        log[l]["converged_outer"] = out.converged
-        log[l]["GW cost"] = out.reg_gw_cost
+        Ts[l] = gw_map
         log[l]["time"] = end - start
-        log[l]["cost_time"] = cost_time
+        
     return Ts, log
+
+
+def get_feature_coupling_pot(
+    data: Tuple[Dict[Number, np.ndarray], Dict[Number, np.ndarray]],
+    Ts: Union[Dict[Number, np.ndarray], np.ndarray],
+    eps=5e-3,
+):
+    """Feature coupling using POT (Sinkhorn)."""
+    X_dict = data[0]
+    Y_dict = data[1]
+    
+    # Concatenate all data
+    X = np.concatenate([X_dict[l] for l in sorted(X_dict.keys())])
+    Y = np.concatenate([Y_dict[l] for l in sorted(X_dict.keys())])
+    
+    # Construct Ts matrix if it is a dict
+    if isinstance(Ts, dict):
+        n_x = sum(len(X_dict[l]) for l in sorted(X_dict.keys()))
+        n_y = sum(len(Y_dict[l]) for l in sorted(X_dict.keys()))
+        Ts_mat = np.zeros((n_x, n_y))
+        
+        idx_x = 0
+        idx_y = 0
+        for l in sorted(X_dict.keys()):
+            nx = len(X_dict[l])
+            ny = len(Y_dict[l])
+            if l in Ts:
+                Ts_mat[idx_x:idx_x+nx, idx_y:idx_y+ny] = Ts[l]
+            idx_x += nx
+            idx_y += ny
+        Ts = Ts_mat
+
+    # Calculate cost matrix M for features
+    # M_kl = sum_ij |X_ik - Y_jl|^2 * Ts_ij
+    #      = sum_ij (X_ik^2 + Y_jl^2 - 2 X_ik Y_jl) * Ts_ij
+    
+    # Term 1: sum_i X_ik^2 * (sum_j Ts_ij) = sum_i X_ik^2 * w1_i
+    w1 = Ts.sum(axis=1)
+    t1 = (X**2).T @ w1  # (d,)
+    
+    # Term 2: sum_j Y_jl^2 * (sum_i Ts_ij) = sum_j Y_jl^2 * w2_j
+    w2 = Ts.sum(axis=0)
+    t2 = (Y**2).T @ w2  # (d',)
+    
+    # Term 3: -2 sum_ij X_ik Y_jl Ts_ij = -2 (X.T @ Ts @ Y)_kl
+    t3 = -2 * X.T @ Ts @ Y
+    
+    M = t1[:, None] + t2[None, :] + t3
+    
+    # Solve OT
+    a = np.ones(X.shape[1]) / X.shape[1]
+    b = np.ones(Y.shape[1]) / Y.shape[1]
+    
+    # Use Sinkhorn for entropic regularization
+    Tv = ot.sinkhorn(a, b, M, reg=eps, numItermax=2000)
+    
+    return Tv, {}
 
 
 def save_confusion_matrix(
@@ -132,8 +155,15 @@ def save_confusion_matrix(
     cm = confusion_matrix(y_true, y_pred)
     # Get class names in order of their indices
     labels = sorted(class_names.keys(), key=lambda k: class_names[k])
-    # Shorten labels for plotting if needed (remove _MRI_... / _PET_...)
-    short_labels = [l.split('_')[0] for l in labels]
+    # Extract AD/CN labels
+    short_labels = []
+    for l in labels:
+        parts = l.split('_')
+        # Find AD, CN, or MCI in the parts
+        for part in parts:
+            if part in ['AD', 'CN', 'MCI']:
+                short_labels.append(part)
+                break
     
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -146,7 +176,7 @@ def save_confusion_matrix(
     )
     plt.xlabel('Predicted')
     plt.ylabel('True')
-    plt.title('Confusion Matrix')
+    plt.title('Confusion Matrix - MRI-PET OT Model')
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
@@ -222,8 +252,9 @@ class MultimodalNiftiDataset(Dataset):
         # Collect MRI files
         mri_files = {}
         for class_dir, label in CLASS_NAMES_MRI.items():
-            dir_path = os.path.join(self.root_dir, class_dir)
+            dir_path = os.path.join(self.root_dir, "MRI-PET", class_dir, "ADNI")
             if not os.path.isdir(dir_path):
+                print(f"Warning: MRI directory not found: {dir_path}")
                 continue
             for root, dirs, files in os.walk(dir_path):
                 for file_name in files:
@@ -232,34 +263,32 @@ class MultimodalNiftiDataset(Dataset):
                         full_path = os.path.join(root, file_name)
                         patient_id = self._extract_patient_id(full_path)
                         if patient_id:
-                            mri_files[patient_id] = (full_path, label)
+                            # Store as (patient_id, class_dir) -> (path, label)
+                            mri_files[(patient_id, class_dir)] = (full_path, label)
         
         # Collect PET files and match with MRI
-        # We collect by class, assuming MRI and PET have same class structure
-        
-        # Temporary storage for samples by class to apply filtering
         samples_by_class: Dict[str, List[Tuple[str, str, int, str]]] = {
             class_name: [] for class_name in CLASS_NAMES_MRI.keys()
         }
 
         for class_dir_pet, label in CLASS_NAMES_PET.items():
-            # Find corresponding MRI class dir
-            # Assuming class names match pattern like AD_PET_... -> AD_MRI_...
-            # But we can just map by label since we have CLASS_NAMES_MRI
+            # Find corresponding MRI class dir (same label)
             class_dir_mri = [k for k, v in CLASS_NAMES_MRI.items() if v == label][0]
             
-            dir_path = os.path.join(self.root_dir, class_dir_pet)
+            dir_path = os.path.join(self.root_dir, "MRI-PET", class_dir_pet, "ADNI_NII")
             if not os.path.isdir(dir_path):
+                print(f"Warning: PET directory not found: {dir_path}")
                 continue
-                
+            
             for root, dirs, files in os.walk(dir_path):
                 for file_name in files:
                     if file_name.endswith((".nii", ".nii.gz")):
                         full_path_pet = os.path.join(root, file_name)
                         patient_id = self._extract_patient_id(full_path_pet)
                         
-                        if patient_id and patient_id in mri_files:
-                            mri_path, mri_label = mri_files[patient_id]
+                        # Check if we have a matching MRI scan for this patient and class
+                        if patient_id and (patient_id, class_dir_mri) in mri_files:
+                            mri_path, mri_label = mri_files[(patient_id, class_dir_mri)]
                             # Ensure labels match
                             if mri_label == label:
                                 samples_by_class[class_dir_mri].append((mri_path, full_path_pet, label, patient_id))
@@ -276,7 +305,6 @@ class MultimodalNiftiDataset(Dataset):
                 class_samples = filtered_samples
             elif self.max_samples_per_class:
                 # Group by patient ID to ensure we select diverse patients
-                # (Though here we likely have one pair per patient anyway)
                 patient_groups = {}
                 for mri, pet, lbl, pid in class_samples:
                     if pid not in patient_groups:
@@ -314,13 +342,12 @@ class MultimodalNiftiDataset(Dataset):
         parts = path.split(os.sep)
         for part in parts:
             # Match pattern: XXX_S_XXXX (e.g., 002_S_5018, 137_S_4672)
-            if re.match(r'^\d{3}_S_\d{4}$', part):
+            if re.match(r'^\d{3}_S_\d{4,5}$', part):
                 return part
         
         # If not found in directories, try to extract from filename
-        # PET files are named like: XXX_S_XXXX_AV45.nii
         filename = os.path.basename(path)
-        match = re.match(r'^(\d{3}_S_\d{4})_', filename)
+        match = re.match(r'^(\d{3}_S_\d{4,5})_', filename)
         if match:
             return match.group(1)
         
@@ -354,12 +381,28 @@ class MultimodalNiftiDataset(Dataset):
         # Load MRI
         mri_img = nib.load(mri_path).get_fdata().astype(np.float32)
         mri_img = np.nan_to_num(mri_img)
+        
+        # Handle both 3D and 4D volumes (squeeze extra dimensions)
+        while mri_img.ndim > 3:
+            if 1 in mri_img.shape:
+                mri_img = np.squeeze(mri_img)
+            else:
+                mri_img = mri_img[..., 0]
+        
         mri_volume = torch.from_numpy(mri_img).unsqueeze(0)
         mri_volume = self._resize_volume(mri_volume)
         
         # Load PET
         pet_img = nib.load(pet_path).get_fdata().astype(np.float32)
         pet_img = np.nan_to_num(pet_img)
+        
+        # Handle both 3D and 4D volumes (squeeze extra dimensions)
+        while pet_img.ndim > 3:
+            if 1 in pet_img.shape:
+                pet_img = np.squeeze(pet_img)
+            else:
+                pet_img = pet_img[..., 0]
+        
         pet_volume = torch.from_numpy(pet_img).unsqueeze(0)
         pet_volume = self._resize_volume(pet_volume)
         
@@ -517,33 +560,6 @@ def cosine_loss(x, y):
     return 1 - F.cosine_similarity(x, y).mean()
 
 
-class SelfAttentionBlock(nn.Module):
-    """Transformer encoder block for feature fusion."""
-    def __init__(self, embed_dim=2048, num_heads=8, ff_dim=2048, dropout=0.1):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads,
-                                               dropout=dropout, batch_first=False)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, embed_dim)
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, x):
-        attn_out, _ = self.self_attn(x, x, x)
-        x = x + self.dropout1(attn_out)
-        x = self.norm1(x)
-        ffn_out = self.ffn(x)
-        x = x + self.dropout2(ffn_out)
-        return self.norm2(x)
-
-
 class MultimodalMRI_PET_OT(nn.Module):
     """Multimodal MRI-PET model with Optimal Transport fusion."""
 
@@ -663,7 +679,7 @@ class MultimodalMRI_PET_OT(nn.Module):
         if training:
             # Compute OT coupling if not provided
             if T_feature_pet2mri is None:
-                # Get coupling using FOT (Feature Optimal Transport)
+                # Get coupling using POT
                 mri_np = mri_fused.detach().cpu().numpy()
                 pet_np = pet_fused.detach().cpu().numpy()
                 batch_size = mri_np.shape[0]
@@ -671,13 +687,15 @@ class MultimodalMRI_PET_OT(nn.Module):
                 # Assume one-to-one correspondence in batch -> Identity coupling for samples
                 Ts = np.eye(batch_size) / batch_size
                 
-                # Wrap in dicts as expected by get_coupling_fot
+                # Wrap in dicts as expected by get_feature_coupling_pot
+                # Use dummy label 0
                 data_tuple = ({0: mri_np}, {0: pet_np})
+                Ts_dict = {0: Ts}
                 
-                T_feature_pet2mri_np, _ = get_coupling_fot(
+                T_feature_pet2mri_np, _ = get_feature_coupling_pot(
                     data_tuple,
-                    Ts=Ts,
-                    eps=1e-3
+                    Ts=Ts_dict,
+                    eps=1e-2
                 )
                 
                 # Convert back to tensor and handle NaNs
@@ -807,7 +825,8 @@ def evaluate(
 
     pbar = tqdm(loader, desc="Validation", leave=False)
     with torch.no_grad():
-        for data, targets in pbar:
+        for i, (data, targets) in enumerate(pbar):
+            # print(f"Eval batch {i}, size {targets.size(0)}")
             for v_num in range(len(data)):
                 data[v_num] = data[v_num].float().to(device)
             targets = targets.long().to(device)
@@ -886,14 +905,14 @@ def group_features_by_label(y, p, max_samples_per_label=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train multimodal MRI-PET model with Optimal Transport",
+        description="Train multimodal MRI-PET model with Optimal Transport (No JAX)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/home/prml/RIMA/datasets/ADNI/MRI-PET",
-        help="Root directory containing MRI and PET folders",
+        default="/home/prml/RIMA/datasets/ADNI",
+        help="Root directory containing ADNI folder",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
@@ -917,7 +936,7 @@ def parse_args():
     parser.add_argument(
         "--save-path",
         type=str,
-        default="results/MRI_PET_OT_AD_CN",
+        default="results/MRI_PET_OT_nojax",
         help="Directory to save results",
     )
     parser.add_argument(
@@ -946,7 +965,7 @@ def parse_args():
     parser.add_argument(
         "--load-patient-ids",
         type=str,
-        default=None,
+        default="/home/prml/RIMA/results/MRI_PET_OT_AD_CN/patient_ids.json",
         help="Path to JSON file containing patient IDs to use.",
     )
     parser.add_argument(
@@ -972,11 +991,13 @@ def main():
 
     # Load patient IDs if specified
     patient_ids_filter = None
-    if args.load_patient_ids:
+    if args.load_patient_ids and os.path.exists(args.load_patient_ids):
         print(f"Loading patient IDs from {args.load_patient_ids}")
         with open(args.load_patient_ids, 'r') as f:
             patient_ids_filter = json.load(f)
         print(f"Loaded patient IDs for {len(patient_ids_filter)} classes")
+    elif args.load_patient_ids:
+        print(f"Warning: Patient IDs file not found at {args.load_patient_ids}. Proceeding without filter.")
 
     # Load dataset
     full_dataset = MultimodalNiftiDataset(
@@ -1039,13 +1060,14 @@ def main():
     model = MultimodalMRI_PET_OT(num_classes=2, model_depth=args.model_depth).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     best_val_loss = float('inf')
+    best_epoch = 0
     
     # Write header
     with open(results_file, "w") as f:
-        f.write("Multimodal MRI-PET with Optimal Transport - ADNI Dataset\n")
+        f.write("Multimodal MRI-PET with Optimal Transport (No JAX) - ADNI Dataset\n")
         f.write("=" * 80 + "\n")
         f.write(f"Dataset: {args.data_dir}\n")
         f.write(f"Train/Val Split: {1-args.val_fraction:.1%}/{args.val_fraction:.1%}\n")
@@ -1085,8 +1107,8 @@ def main():
         )
         
         # Compute OT coupling for validation
-        T_dict_pet2mri, _ = get_coupling_egw_ott_fixed((grouped_pet, grouped_mri))
-        T_feature_pet2mri, _ = get_coupling_fot((grouped_pet, grouped_mri), T_dict_pet2mri)
+        T_dict_pet2mri, _ = get_coupling_gromov_pot((grouped_pet, grouped_mri))
+        T_feature_pet2mri, _ = get_feature_coupling_pot((grouped_pet, grouped_mri), T_dict_pet2mri)
         
         # Validate
         val_loss, val_acc, val_preds, val_targets = evaluate(
@@ -1114,6 +1136,7 @@ def main():
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch
             torch.save(
                 {
                     "epoch": epoch,
@@ -1133,17 +1156,15 @@ def main():
     # Final summary
     with open(results_file, "a") as f:
         f.write("\n" + "=" * 80 + "\n")
-        f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
+        f.write(f"BEST MODEL: Epoch {best_epoch} with Validation Loss: {best_val_loss:.4f}\n")
         f.write(f"Best model saved to: {model_path}\n")
+        f.write("=" * 80 + "\n")
     
     # Load best model and generate confusion matrix
     print(f"Loading best model from {model_path} for confusion matrix...")
     checkpoint = torch.load(model_path)
     model.load_state_dict(checkpoint["model_state_dict"])
     
-    # Need to re-compute OT coupling for validation with best model features?
-    # Ideally yes, but for now we can reuse the last one or recompute.
-    # To be precise, we should recompute features with the best model.
     print("Re-extracting features with best model for OT coupling...")
     mri_features, pet_features, train_labels = feature_extract(model, train_loader, device)
     grouped_mri = group_features_by_label(
@@ -1156,11 +1177,11 @@ def main():
         pet_features.cpu().numpy(),
         max_samples_per_label=args.max_jax_samples,
     )
-    T_dict_pet2mri, _ = get_coupling_egw_ott_fixed((grouped_pet, grouped_mri))
-    T_feature_pet2mri, _ = get_coupling_fot((grouped_pet, grouped_mri), T_dict_pet2mri)
+    T_dict_pet2mri, _ = get_coupling_gromov_pot((grouped_pet, grouped_mri))
+    T_feature_pet2mri, _ = get_feature_coupling_pot((grouped_pet, grouped_mri), T_dict_pet2mri)
 
     _, _, val_preds, val_targets = evaluate(model, val_loader, criterion, device, T_feature_pet2mri)
-    cm_path = os.path.join(args.save_path, "confusion_matrix.png")
+    cm_path = os.path.join(args.save_path, "confusion_matrix_MRI_PET_OT.png")
     save_confusion_matrix(val_targets, val_preds, CLASS_NAMES_MRI, cm_path)
     print(f"Saved confusion matrix to {cm_path}")
     
