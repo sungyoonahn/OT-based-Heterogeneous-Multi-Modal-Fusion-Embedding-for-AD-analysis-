@@ -1,0 +1,12 @@
+setup,modality,model_depth,data_split,dropout,pretrained,attention_target,best_val_loss,best_epoch,val_acc,precision,recall,f1_score,specificity
+mri_depth101_balanced,mri,101,balanced,,,,0.5917,13,0.7308,0.7364,0.7308,0.7292,0.7308
+mri_depth152_all,mri,152,all,,,,0.6085,6,0.6667,0.8286,0.5385,0.4680,0.5385
+mri_depth152_balanced,mri,152,balanced,,,,0.6052,21,0.6538,0.6576,0.6538,0.6518,0.6538
+mri_depth200_all,mri,200,all,,,,0.6359,3,0.6528,0.6284,0.5360,0.4862,0.5360
+mri_depth200_balanced,mri,200,balanced,,,,0.5501,35,0.6731,0.6733,0.6731,0.6730,0.6731
+pet_depth101_all,pet,101,all,,,,0.2836,135,0.8611,0.8495,0.8495,0.8495,0.8495
+pet_depth101_balanced,pet,101,balanced,,,,0.4813,23,0.8462,0.8482,0.8462,0.8459,0.8462
+pet_depth152_all,pet,152,all,,,,0.3528,35,0.8611,0.8495,0.8495,0.8495,0.8495
+pet_depth152_balanced,pet,152,balanced,,,,0.5172,22,0.7500,0.7504,0.7500,0.7499,0.7500
+pet_depth200_all,pet,200,all,,,,0.3422,35,0.8611,0.8731,0.8244,0.8403,0.8244
+pet_depth200_balanced,pet,200,balanced,,,,0.4707,17,0.8269,0.8395,0.8269,0.8253,0.8269

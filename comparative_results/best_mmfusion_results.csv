@@ -1,0 +1,7 @@
+setup,modality,model_depth,data_split,dropout,pretrained,attention_target,best_val_loss,best_epoch,val_acc,precision,recall,f1_score,specificity
+depth101_all,mmfusion,101,all,,,,0.4923,23,0.8056,0.7893,0.7893,0.7893,0.7893
+depth101_balanced,mmfusion,101,balanced,,,,0.5181,13,0.8077,0.8095,0.8077,0.8074,0.8077
+depth152_all,mmfusion,152,all,,,,0.4317,30,0.8750,0.8630,0.8687,0.8656,0.8687
+depth152_balanced,mmfusion,152,balanced,,,,0.5432,2,0.7692,0.7708,0.7692,0.7689,0.7692
+depth200_all,mmfusion,200,all,,,,0.7196,2,0.4028,0.3812,0.3737,0.3757,0.3737
+depth200_balanced,mmfusion,200,balanced,,,,0.9447,6,0.3654,0.3549,0.3654,0.3537,0.3654
