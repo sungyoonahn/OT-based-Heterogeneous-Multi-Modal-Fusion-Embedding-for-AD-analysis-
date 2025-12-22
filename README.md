@@ -1,8 +1,19 @@
-# OT-based-Heterogeneous-Multi-Modal-Fusion-Embedding-for-AD-analysis-
+# OT-based Heterogeneous Multi-Modal Fusion Embedding for AD Analysis
 
-Original code for OT from https://github.com/Qinkaiyu/RIMA
+This repository implements an Optimal Transport (OT) based framework for fusing heterogeneous multi-modal data, specifically tailored for Alzheimer's Disease (AD) analysis.
 
-The currenct code is a modified version of the above to encompass heterogenous MultiModal AD data
+## 📌 Key Features
+- **Heterogeneous Fusion:** Specialized for multi-modal AD data integration.
+- **Multi-Modal Support:** Currently supports MRI and PET data from the **ADNI** dataset.
+- **Optimized Performance:** (Ongoing) Migrating to JAX for significantly faster training speeds.
 
-Current code takes MRI and PET data from ADNI
-Currently working on a fix for jax dependency for faster training
+## 🛠 Tech Stack & Status
+- **Language:** Python
+- **Core Library:** Based on [RIMA](https://github.com/Qinkaiyu/RIMA)
+- **Status:** (Planned) Migration to JAX for optimized training performance.
+
+## 📂 Dataset
+- **ADNI (Alzheimer's Disease Neuroimaging Initiative):** Primarily utilizes MRI and PET imaging data.
+
+## 📜 Acknowledgments
+- Original OT implementation: [Qinkaiyu/RIMA](https://github.com/Qinkaiyu/RIMA)
